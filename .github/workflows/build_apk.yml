@@ -26,12 +26,23 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Khởi tạo mã nguồn và Dependencies
+      - name: Khởi tạo Project & Cấu hình Android Native
         run: |
+          rm -rf my_app
           flutter create --org com.gemini.native --project-name gemini_native_app my_app
           cd my_app
-          flutter pub add provider shared_preferences http flutter_markdown
           
+          # Cấp quyền Internet cho Android
+          sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/>\n    <application/' android/app/src/main/AndroidManifest.xml
+          
+          # Nâng minSdk lên 21 để hỗ trợ toàn diện các thư viện
+          sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 21/' android/app/build.gradle || true
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' android/app/build.gradle || true
+
+          # Cài đặt thư viện
+          flutter pub add provider shared_preferences http flutter_markdown
+
+          # Nạp mã nguồn giao diện Gemini 3.7
           cat << 'EOF' > lib/main.dart
           import 'dart:convert';
           import 'dart:ui';
@@ -507,10 +518,10 @@ jobs:
           }
           EOF
 
-      - name: Biên dịch file APK
+      - name: Biên dịch file APK Release
         run: |
           cd my_app
-          flutter build apk --release --no-tree-shake-icons
+          flutter build apk --release
 
       - name: Tải file APK lên Artifacts
         uses: actions/upload-artifact@v4

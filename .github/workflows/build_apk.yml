@@ -9,37 +9,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout mã nguồn
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Thiết lập Java 17
+      - name: Cài đặt Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Thiết lập Flutter
+      - name: Cài đặt Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.22.2'
           channel: 'stable'
           cache: true
 
-      - name: Dọn rác và Tạo ứng dụng Gemini 3.7 Chuẩn
+      - name: Dọn dẹp và Nạp mã nguồn Gemini 3.7 Bất Tử
         run: |
-          # Dọn dẹp toàn bộ file xung đột cũ
           find . -maxdepth 1 ! -name '.' ! -name '..' ! -name '.git' ! -name '.github' -exec rm -rf {} +
-          
-          # Khởi tạo Flutter Project chuẩn
           flutter create --org com.gemini.ai --project-name gemini_app .
-          
-          # Cấp quyền INTERNET Android
           sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/>\n    <application/' android/app/src/main/AndroidManifest.xml
-          
-          # Thêm thư viện HTTP kết nối trực tiếp API
           flutter pub add http
 
-          # Nạp toàn bộ giao diện & logic Gemini 3.7 Flash Native
           cat << 'EOF' > lib/main.dart
           import 'dart:convert';
           import 'dart:io';
@@ -97,6 +89,7 @@ jobs:
             String _apiKey = '';
             int _gradientIdx = 0;
             bool _isLoading = false;
+            String _loadingStatus = "Gemini 3.7 đang suy nghĩ...";
             int _currentSessionIdx = 0;
             List<ChatSession> _sessions = [
               ChatSession(title: "Đoạn chat mới", messages: [])
@@ -151,6 +144,7 @@ jobs:
               } catch (_) {}
             }
 
+            // HÀM GỌI API THÔNG MINH (AUTO-RETRY & FALLBACK BẤT TỬ)
             void _sendMessage() async {
               final text = _textCtrl.text.trim();
               if (text.isEmpty) return;
@@ -169,52 +163,76 @@ jobs:
                   currentSession.title = text.length > 22 ? "${text.substring(0, 22)}..." : text;
                 }
                 _isLoading = true;
+                _loadingStatus = "Gemini 3.7 đang suy nghĩ...";
               });
 
               _scrollToBottom();
 
-              try {
-                final url = Uri.parse(
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=$_apiKey");
+              final models = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+              bool success = false;
+              String lastError = "";
 
-                final contents = currentSession.messages.map((m) => {
-                      "role": m.isUser ? "user" : "model",
-                      "parts": [
-                        {"text": m.text}
-                      ]
-                    }).toList();
+              final contents = currentSession.messages.map((m) => {
+                    "role": m.isUser ? "user" : "model",
+                    "parts": [{"text": m.text}]
+                  }).toList();
 
-                final response = await http.post(
-                  url,
-                  headers: {"Content-Type": "application/json"},
-                  body: jsonEncode({"contents": contents}),
-                );
+              for (String model in models) {
+                if (success) break;
 
-                if (response.statusCode == 200) {
-                  final data = jsonDecode(response.body);
-                  final reply = data['candidates'][0]['content']['parts'][0]['text'];
-                  setState(() {
-                    currentSession.messages.add(ChatMessage(text: reply, isUser: false));
-                  });
-                } else {
-                  final err = jsonDecode(response.body);
-                  setState(() {
-                    currentSession.messages.add(ChatMessage(
-                        text: "❌ Lỗi (${response.statusCode}): ${err['error']?['message'] ?? 'Không phản hồi'}",
-                        isUser: false));
-                  });
+                for (int attempt = 1; attempt <= 2; attempt++) {
+                  try {
+                    if (attempt > 1 || model != models.first) {
+                      setState(() {
+                        _loadingStatus = "Đang kết nối lại ($model)...";
+                      });
+                    }
+
+                    final url = Uri.parse(
+                        "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$_apiKey");
+
+                    final response = await http.post(
+                      url,
+                      headers: {"Content-Type": "application/json"},
+                      body: jsonEncode({"contents": contents}),
+                    );
+
+                    if (response.statusCode == 200) {
+                      final data = jsonDecode(response.body);
+                      final reply = data['candidates'][0]['content']['parts'][0]['text'];
+                      setState(() {
+                        currentSession.messages.add(ChatMessage(text: reply, isUser: false));
+                      });
+                      success = true;
+                      break;
+                    } else if (response.statusCode == 503 || response.statusCode == 429) {
+                      // Máy chủ Google bận -> Tự chờ 1.2 giây rồi thử lại
+                      await Future.delayed(const Duration(milliseconds: 1200));
+                    } else {
+                      final err = jsonDecode(response.body);
+                      lastError = err['error']?['message'] ?? 'Lỗi API';
+                      break;
+                    }
+                  } catch (e) {
+                    lastError = e.toString();
+                    await Future.delayed(const Duration(milliseconds: 1000));
+                  }
                 }
-              } catch (e) {
-                setState(() {
-                  currentSession.messages.add(ChatMessage(text: "❌ Lỗi kết nối: $e", isUser: false));
-                });
-              } finally {
-                setState(() {
-                  _isLoading = false;
-                });
-                _saveData();
-                _scrollToBottom();
               }
+
+              if (!success) {
+                setState(() {
+                  currentSession.messages.add(ChatMessage(
+                      text: "❌ Không thể kết nối sau nhiều lần thử: $lastError",
+                      isUser: false));
+                });
+              }
+
+              setState(() {
+                _isLoading = false;
+              });
+              _saveData();
+              _scrollToBottom();
             }
 
             void _scrollToBottom() {
@@ -246,7 +264,7 @@ jobs:
                   child: SafeArea(
                     child: Column(
                       children: [
-                        // Compact Header Glassmorphism (52px)
+                        // Header Kính Mờ Gọn Gàng
                         Container(
                           height: 52,
                           margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -280,7 +298,7 @@ jobs:
                           ),
                         ),
 
-                        // Message List
+                        // Khung Chat
                         Expanded(
                           child: currentSession.messages.isEmpty
                               ? Center(
@@ -335,19 +353,19 @@ jobs:
                         ),
 
                         if (_isLoading)
-                          const Padding(
-                            padding: EdgeInsets.all(8.0),
+                          Padding(
+                            padding: const EdgeInsets.all(8.0),
                             child: Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent)),
-                                SizedBox(width: 8),
-                                Text("Gemini 3.7 đang suy nghĩ...", style: TextStyle(color: Colors.cyanAccent, fontSize: 12)),
+                                const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent)),
+                                const SizedBox(width: 8),
+                                Text(_loadingStatus, style: const TextStyle(color: Colors.cyanAccent, fontSize: 12)),
                               ],
                             ),
                           ),
 
-                        // Bottom Input Glass
+                        // Thanh Nhập Liệu
                         Padding(
                           padding: const EdgeInsets.fromLTRB(12, 4, 12, 10),
                           child: _buildGlass(
@@ -547,22 +565,4 @@ jobs:
                     padding: padding,
                     decoration: BoxDecoration(
                       color: color ?? Colors.white.withOpacity(0.08),
-                      borderRadius: BorderRadius.circular(borderRadius),
-                      border: Border.all(color: Colors.white.withOpacity(0.12)),
-                    ),
-                    child: child,
-                  ),
-                ),
-              );
-            }
-          }
-          EOF
-
-      - name: Biên dịch file APK Release
-        run: flutter build apk --release --no-tree-shake-icons
-
-      - name: Tải file APK lên Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Gemini-3.7-Flash-Native-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+                      borderRadius: BorderRadius.circular(borderRadius)

@@ -1,0 +1,45 @@
+name: Build Android APK Native
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Thiết lập Java 17
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Thiết lập Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: 'stable'
+          cache: true
+
+      # Tự động tạo thư mục android nếu repo chỉ tải lên thư mục lib
+      - name: Cấu hình nền tảng Android
+        run: flutter create . --platforms android
+
+      - name: Cài đặt Dependencies
+        run: flutter pub get
+
+      - name: Biên dịch file APK Release
+        run: flutter build apk --release
+
+      - name: Tải file APK lên Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemini-3.7-Flash-Native-APK
+          path: build/app/outputs/flutter-apk/app-release.apk

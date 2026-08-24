@@ -1,9 +1,7 @@
-name: Build Android APK Native
+name: Build Gemini 3.7 Native APK
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
@@ -12,34 +10,510 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout mã nguồn
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Thiết lập Java 17
-        uses: actions/setup-java@v3
+      - name: Cài đặt Java 17
+        uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: 'temurin'
           java-version: '17'
 
-      - name: Thiết lập Flutter
+      - name: Cài đặt Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.x'
+          flutter-version: '3.22.2'
           channel: 'stable'
           cache: true
 
-      # Tự động tạo thư mục android nếu repo chỉ tải lên thư mục lib
-      - name: Cấu hình nền tảng Android
-        run: flutter create . --platforms android
+      - name: Khởi tạo mã nguồn và Dependencies
+        run: |
+          flutter create --org com.gemini.native --project-name gemini_native_app my_app
+          cd my_app
+          flutter pub add provider shared_preferences http flutter_markdown
+          
+          cat << 'EOF' > lib/main.dart
+          import 'dart:convert';
+          import 'dart:ui';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:provider/provider.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:flutter_markdown/flutter_markdown.dart';
 
-      - name: Cài đặt Dependencies
-        run: flutter pub get
+          class ChatMessage {
+            final String text;
+            final bool isUser;
+            ChatMessage({required this.text, required this.isUser});
 
-      - name: Biên dịch file APK Release
-        run: flutter build apk --release
+            Map<String, dynamic> toJson() => {'text': text, 'isUser': isUser};
+            factory ChatMessage.fromJson(Map<String, dynamic> json) =>
+                ChatMessage(text: json['text'], isUser: json['isUser']);
+          }
+
+          class ChatSession {
+            String title;
+            List<ChatMessage> messages;
+            ChatSession({required this.title, required this.messages});
+
+            Map<String, dynamic> toJson() => {
+                  'title': title,
+                  'messages': messages.map((m) => m.toJson()).toList(),
+                };
+            factory ChatSession.fromJson(Map<String, dynamic> json) => ChatSession(
+                  title: json['title'],
+                  messages: (json['messages'] as List)
+                      .map((m) => ChatMessage.fromJson(m))
+                      .toList(),
+                );
+          }
+
+          class GradientTheme {
+            final String name;
+            final List<Color> colors;
+            const GradientTheme({required this.name, required this.colors});
+          }
+
+          class AppProvider with ChangeNotifier {
+            int _gradientIndex = 0;
+            String _apiKey = '';
+            List<ChatSession> _sessions = [];
+            int _currentSessionIdx = 0;
+            bool _isLoading = false;
+
+            final List<GradientTheme> presets = const [
+              GradientTheme(name: "Twilight", colors: [Color(0xFF0F172A), Color(0xFF1E1B4B), Color(0xFF311042)]),
+              GradientTheme(name: "Cyber", colors: [Color(0xFF090A0F), Color(0xFF180E29), Color(0xFF003049)]),
+              GradientTheme(name: "Emerald", colors: [Color(0xFF021B1A), Color(0xFF06302B), Color(0xFF00120B)]),
+              GradientTheme(name: "Midnight", colors: [Color(0xFF050505), Color(0xFF12131C), Color(0xFF1C1D24)]),
+            ];
+
+            int get gradientIndex => _gradientIndex;
+            GradientTheme get currentTheme => presets[_gradientIndex];
+            String get apiKey => _apiKey;
+            List<ChatSession> get sessions => _sessions;
+            int get currentSessionIdx => _currentSessionIdx;
+            bool get isLoading => _isLoading;
+            ChatSession get currentSession => _sessions[_currentSessionIdx];
+
+            AppProvider() {
+              _init();
+            }
+
+            void _init() async {
+              final prefs = await SharedPreferences.getInstance();
+              _apiKey = prefs.getString('api_key') ?? '';
+              _gradientIndex = prefs.getInt('gradient_idx') ?? 0;
+              final saved = prefs.getString('sessions');
+              if (saved != null) {
+                try {
+                  final List decoded = jsonDecode(saved);
+                  _sessions = decoded.map((s) => ChatSession.fromJson(s)).toList();
+                } catch (_) {}
+              }
+              if (_sessions.isEmpty) {
+                _sessions.add(ChatSession(title: "Đoạn chat mới", messages: []));
+              }
+              notifyListeners();
+            }
+
+            void setGradient(int index) async {
+              _gradientIndex = index;
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setInt('gradient_idx', index);
+              notifyListeners();
+            }
+
+            void setApiKey(String key) async {
+              _apiKey = key.trim();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('api_key', _apiKey);
+              notifyListeners();
+            }
+
+            void newChat() {
+              _sessions.insert(0, ChatSession(title: "Đoạn chat mới", messages: []));
+              _currentSessionIdx = 0;
+              _save();
+              notifyListeners();
+            }
+
+            void selectSession(int index) {
+              _currentSessionIdx = index;
+              notifyListeners();
+            }
+
+            void deleteSession(int index) {
+              _sessions.removeAt(index);
+              if (_sessions.isEmpty) {
+                _sessions.add(ChatSession(title: "Đoạn chat mới", messages: []));
+              }
+              _currentSessionIdx = 0;
+              _save();
+              notifyListeners();
+            }
+
+            void _save() async {
+              final prefs = await SharedPreferences.getInstance();
+              prefs.setString('sessions', jsonEncode(_sessions.map((s) => s.toJson()).toList()));
+            }
+
+            Future<void> sendMessage(String text) async {
+              if (text.trim().isEmpty) return;
+              if (_apiKey.isEmpty) throw Exception("Chưa cài API Key!");
+
+              currentSession.messages.add(ChatMessage(text: text.trim(), isUser: true));
+              if (currentSession.messages.length == 1) {
+                currentSession.title = text.length > 20 ? "${text.substring(0, 20)}..." : text;
+              }
+
+              _isLoading = true;
+              notifyListeners();
+
+              try {
+                final url = Uri.parse("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=$_apiKey");
+                final contents = currentSession.messages.map((m) => {
+                  "role": m.isUser ? "user" : "model",
+                  "parts": [{"text": m.text}]
+                }).toList();
+
+                final res = await http.post(
+                  url,
+                  headers: {"Content-Type": "application/json"},
+                  body: jsonEncode({"contents": contents}),
+                );
+
+                if (res.statusCode == 200) {
+                  final data = jsonDecode(res.body);
+                  final reply = data['candidates'][0]['content']['parts'][0]['text'];
+                  currentSession.messages.add(ChatMessage(text: reply, isUser: false));
+                } else {
+                  final err = jsonDecode(res.body);
+                  currentSession.messages.add(ChatMessage(text: "❌ Lỗi: ${err['error']?['message'] ?? res.statusCode}", isUser: false));
+                }
+              } catch (e) {
+                currentSession.messages.add(ChatMessage(text: "❌ Lỗi kết nối: $e", isUser: false));
+              } finally {
+                _isLoading = false;
+                _save();
+                notifyListeners();
+              }
+            }
+          }
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(statusBarColor: Colors.transparent));
+            runApp(
+              ChangeNotifierProvider(
+                create: (_) => AppProvider(),
+                child: const MaterialApp(
+                  debugShowCheckedModeBanner: false,
+                  home: GeminiScreen(),
+                ),
+              ),
+            );
+          }
+
+          class GeminiScreen extends StatefulWidget {
+            const GeminiScreen({super.key});
+            @override
+            State<GeminiScreen> createState() => _GeminiScreenState();
+          }
+
+          class _GeminiScreenState extends State<GeminiScreen> {
+            final TextEditingController _ctrl = TextEditingController();
+            final ScrollController _scroll = ScrollController();
+
+            void _scrollToBottom() {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (_scroll.hasClients) {
+                  _scroll.animateTo(_scroll.position.maxScrollExtent,
+                      duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+                }
+              });
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final prov = Provider.of<AppProvider>(context);
+
+              return Scaffold(
+                extendBodyBehindAppBar: true,
+                drawer: _buildDrawer(context, prov),
+                body: Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: prov.currentTheme.colors,
+                    ),
+                  ),
+                  child: SafeArea(
+                    child: Column(
+                      children: [
+                        Container(
+                          height: 52,
+                          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          child: _glass(
+                            borderRadius: 14,
+                            padding: const EdgeInsets.symmetric(horizontal: 6),
+                            child: Row(
+                              children: [
+                                Builder(
+                                  builder: (ctx) => IconButton(
+                                    icon: const Icon(Icons.menu_rounded, color: Colors.white),
+                                    onPressed: () => Scaffold.of(ctx).openDrawer(),
+                                  ),
+                                ),
+                                Expanded(
+                                  child: Text(
+                                    prov.currentSession.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.palette_outlined, color: Colors.cyanAccent),
+                                  onPressed: () => _showGradientPicker(context, prov),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: prov.currentSession.messages.isEmpty
+                              ? const Center(
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(Icons.auto_awesome, size: 50, color: Colors.cyanAccent),
+                                      SizedBox(height: 12),
+                                      Text("Gemini 3.7 Flash Native\nSẵn sàng phục vụ bạn!", textAlign: TextAlign.center, style: TextStyle(color: Colors.white70)),
+                                    ],
+                                  ),
+                                )
+                              : ListView.builder(
+                                  controller: _scroll,
+                                  padding: const EdgeInsets.all(12),
+                                  itemCount: prov.currentSession.messages.length,
+                                  itemBuilder: (context, i) {
+                                    final msg = prov.currentSession.messages[i];
+                                    return Align(
+                                      alignment: msg.isUser ? Alignment.centerRight : Alignment.centerLeft,
+                                      child: Container(
+                                        margin: const EdgeInsets.only(bottom: 12),
+                                        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.85),
+                                        child: _glass(
+                                          color: msg.isUser ? Colors.blue.withOpacity(0.4) : Colors.black.withOpacity(0.3),
+                                          borderRadius: 18,
+                                          padding: const EdgeInsets.all(12),
+                                          child: MarkdownBody(
+                                            data: msg.text,
+                                            styleSheet: MarkdownStyleSheet(p: const TextStyle(color: Colors.white, fontSize: 15)),
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                        ),
+                        if (prov.isLoading)
+                          const Padding(
+                            padding: EdgeInsets.all(8.0),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent)),
+                                SizedBox(width: 8),
+                                Text("Gemini 3.7 đang suy nghĩ...", style: TextStyle(color: Colors.cyanAccent, fontSize: 12)),
+                              ],
+                            ),
+                          ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                          child: _glass(
+                            borderRadius: 25,
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: TextField(
+                                    controller: _ctrl,
+                                    style: const TextStyle(color: Colors.white),
+                                    decoration: const InputDecoration(
+                                      hintText: "Nhập câu hỏi...",
+                                      hintStyle: TextStyle(color: Colors.white38),
+                                      border: InputBorder.none,
+                                    ),
+                                  ),
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.send_rounded, color: Colors.cyanAccent),
+                                  onPressed: () {
+                                    final txt = _ctrl.text;
+                                    _ctrl.clear();
+                                    prov.sendMessage(txt).catchError((e) {
+                                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+                                    });
+                                    _scrollToBottom();
+                                  },
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildDrawer(BuildContext context, AppProvider prov) {
+              return Drawer(
+                backgroundColor: Colors.transparent,
+                child: _glass(
+                  borderRadius: 0,
+                  color: Colors.black.withOpacity(0.85),
+                  child: SafeArea(
+                    child: Column(
+                      children: [
+                        ListTile(
+                          leading: const Icon(Icons.add, color: Colors.white),
+                          title: const Text("Đoạn chat mới", style: TextStyle(color: Colors.white)),
+                          onTap: () {
+                            prov.newChat();
+                            Navigator.pop(context);
+                          },
+                        ),
+                        const Divider(color: Colors.white24),
+                        Expanded(
+                          child: ListView.builder(
+                            itemCount: prov.sessions.length,
+                            itemBuilder: (ctx, i) => ListTile(
+                              leading: const Icon(Icons.chat_bubble_outline, color: Colors.white70, size: 18),
+                              title: Text(prov.sessions[i].title, maxLines: 1, style: TextStyle(color: i == prov.currentSessionIdx ? Colors.cyanAccent : Colors.white)),
+                              trailing: IconButton(
+                                icon: const Icon(Icons.delete_outline, color: Colors.white38, size: 18),
+                                onPressed: () => prov.deleteSession(i),
+                              ),
+                              onTap: () {
+                                prov.selectSession(i);
+                                Navigator.pop(context);
+                              },
+                            ),
+                          ),
+                        ),
+                        const Divider(color: Colors.white24),
+                        ListTile(
+                          leading: const Icon(Icons.key, color: Colors.amberAccent),
+                          title: const Text("Cài đặt API Key", style: TextStyle(color: Colors.white)),
+                          subtitle: Text(prov.apiKey.isNotEmpty ? "Đã lưu" : "Chưa có Key", style: const TextStyle(color: Colors.white38, fontSize: 12)),
+                          onTap: () => _showApiKeyDialog(context, prov),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            void _showApiKeyDialog(BuildContext context, AppProvider prov) {
+              final keyCtrl = TextEditingController(text: prov.apiKey);
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  backgroundColor: const Color(0xFF1E202A),
+                  title: const Text("Nhập Gemini API Key", style: TextStyle(color: Colors.white)),
+                  content: TextField(
+                    controller: keyCtrl,
+                    style: const TextStyle(color: Colors.cyanAccent),
+                    decoration: const InputDecoration(hintText: "AIzaSy...", hintStyle: TextStyle(color: Colors.white30)),
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Đóng")),
+                    ElevatedButton(
+                      onPressed: () {
+                        prov.setApiKey(keyCtrl.text);
+                        Navigator.pop(ctx);
+                      },
+                      child: const Text("Lưu"),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            void _showGradientPicker(BuildContext context, AppProvider prov) {
+              showModalBottomSheet(
+                context: context,
+                backgroundColor: Colors.transparent,
+                builder: (ctx) => _glass(
+                  borderRadius: 24,
+                  color: Colors.black.withOpacity(0.9),
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text("Chọn màu nền loang", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 16),
+                      SizedBox(
+                        height: 70,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: prov.presets.length,
+                          separatorBuilder: (_, __) => const SizedBox(width: 12),
+                          itemBuilder: (ctx, i) => GestureDetector(
+                            onTap: () => prov.setGradient(i),
+                            child: Container(
+                              width: 60,
+                              height: 60,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                gradient: LinearGradient(colors: prov.presets[i].colors),
+                                border: Border.all(color: prov.gradientIndex == i ? Colors.cyanAccent : Colors.white24, width: 2),
+                              ),
+                            ),
+                          ),
+                        ),
+                      )
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            Widget _glass({required Widget child, double borderRadius = 16, EdgeInsetsGeometry? padding, Color? color}) {
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(borderRadius),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
+                  child: Container(
+                    padding: padding,
+                    decoration: BoxDecoration(
+                      color: color ?? Colors.white.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(borderRadius),
+                      border: Border.all(color: Colors.white.withOpacity(0.12)),
+                    ),
+                    child: child,
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Biên dịch file APK
+        run: |
+          cd my_app
+          flutter build apk --release --no-tree-shake-icons
 
       - name: Tải file APK lên Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Gemini-3.7-Flash-Native-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: my_app/build/app/outputs/flutter-apk/app-release.apk
